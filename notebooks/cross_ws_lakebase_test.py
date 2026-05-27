@@ -13,7 +13,7 @@
 # MAGIC 4. Resolve the endpoint host
 # MAGIC 5. Connect with psycopg2 and run validation queries
 # MAGIC
-# MAGIC See the repo `GUIDE.md` for the end-to-end setup (SP creation, OAuth
+# MAGIC See the repo `README.md` for the end-to-end setup (SP creation, OAuth
 # MAGIC client secret, Lakebase Postgres role, secret scope, gotchas).
 
 # COMMAND ----------
