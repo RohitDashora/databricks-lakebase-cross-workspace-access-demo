@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Databricks
+.databricks/
+*.dbc
+
+# Local scratch / secrets — never commit
+*.local.*
+secrets.json
+*.tfstate
+*.tfstate.backup
