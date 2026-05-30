@@ -42,10 +42,13 @@ Verified end-to-end on 2026-05-27:
 ```
 .
 ├── README.md                              this file (overview + walkthrough)
+├── NETWORKING.md                          locked-down networks: IP ACLs,
+│                                          PrivateLink, firewalls — diagnosis + fixes
 ├── LICENSE                                Apache 2.0
 └── notebooks/
-    └── cross_ws_lakebase_test.py          drop into your compute workspace,
-                                           attach to any classic cluster
+    ├── cross_ws_lakebase_test.py          the happy-path read
+    └── cross_ws_lakebase_netdiag.py       network diagnostic — run when the
+                                           read fails behind a firewall / PrivateLink
 ```
 
 ---
@@ -85,6 +88,14 @@ The hop from the notebook to Postgres is direct over the public internet — no
 PrivateLink, no VPC peering, no special networking is needed for this specific
 flow (the Lakebase endpoint is reachable from any classic Databricks cluster
 with default egress).
+
+> **Behind a firewall, IP access list, or PrivateLink?** That direct hop is
+> exactly what breaks. See **[NETWORKING.md](NETWORKING.md)** for the two-leg
+> model, the restriction→fix matrix, and a diagnostic notebook
+> (`notebooks/cross_ws_lakebase_netdiag.py`) that tells you which hop is failing
+> and why. One thing to know up front: the Postgres path is **TCP 5432** (not
+> 443), and **Shared-mode classic clusters block 5432** — use a dedicated /
+> single-user cluster.
 
 ### Credential mint chain
 
