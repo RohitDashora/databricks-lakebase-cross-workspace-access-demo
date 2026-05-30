@@ -39,16 +39,55 @@ Key facts that drive everything below:
 
 ---
 
+## Authentication and network reachability are different layers
+
+A frequent point of confusion: *"I'm authenticating with a service principal
+client_id/secret — why does the cluster's access mode matter?"*
+
+Because they govern different things. Credentials decide **who you are**; the
+network path decides **whether your packets can even get to the database**. Auth
+can't help if the connection never leaves the cluster.
+
+`psycopg2.connect()` happens in this order:
+
+```
+1. open TCP socket to ep-*.database...:5432   ← cluster access mode + firewall + PrivateLink gate THIS
+2. TLS handshake
+3. send credentials (user = SP applicationId, password = Lakebase DB token)  ← auth happens HERE
+4. Postgres accepts / rejects the login + checks GRANTs
+```
+
+- **Steps 1–2 are the network layer** — governed by cluster access mode, egress
+  firewall, IP access lists, and PrivateLink. If this fails you get a **TCP
+  timeout/refused** and your credentials are never even presented.
+- **Steps 3–4 are the auth layer** — governed by your SP OAuth credentials and
+  the Postgres role/GRANTs. If this fails you get **`password authentication
+  failed`** or **`permission denied`**.
+
+You need **both**: an open road (steps 1–2) *and* the right key (steps 3–4).
+Valid credentials over a blocked network look exactly like a firewall problem;
+a perfect network with a missing GRANT looks exactly like an auth problem. The
+diagnostic notebook tests them as separate probes for exactly this reason —
+`TCP_TIMEOUT` on Leg B is a network finding, `PG_AUTH_FAILED` is not.
+
+**Analogy:** the client_id/secret is the key to the building. A Standard/Shared
+cluster (below) is the road to the building being closed — the key is irrelevant
+if you can't drive there.
+
 ## Prerequisite that masquerades as a network bug
 
-**Shared / `USER_ISOLATION` classic clusters block outbound TCP 5432 with
-iptables**, no matter how the network is configured. Leg B only works from:
+**Standard / Shared (`USER_ISOLATION`) classic clusters block arbitrary outbound
+TCP — including 5432** — no matter how the network is configured or how valid
+your credentials are. This is a multi-tenancy isolation feature: user code on a
+shared cluster isn't allowed to open arbitrary network sockets. It is **not**
+Lakebase-specific. Leg B only works from:
 
-- a **dedicated / single-user** classic cluster, or
+- a **Dedicated / single-user** classic cluster, or
 - **serverless** compute.
 
 If `psycopg2` can't reach 5432 but the rest of your network looks fine, check the
-cluster's access mode **first**. The diagnostic notebook flags this in Probe 0.
+cluster's access mode **first**. The diagnostic notebook flags this in Probe 0
+(it reads the mode from the Clusters API).
 
 ---
 

@@ -140,36 +140,72 @@ def tcp_probe(step, leg, host, port, timeout=12):
 
 # MAGIC %md
 # MAGIC ## Probe 0 — Cluster access mode (the silent 5432 killer)
-# MAGIC **Shared / `USER_ISOLATION` classic clusters block outbound TCP 5432 with
-# MAGIC iptables**, regardless of any network config. The Postgres data path (Leg B)
-# MAGIC only works from a **dedicated / single-user** classic cluster (or serverless).
-# MAGIC If this probe warns, switch cluster access mode before debugging anything else.
+# MAGIC **Standard / Shared (`USER_ISOLATION`) classic clusters block arbitrary
+# MAGIC outbound TCP — including 5432** — regardless of any network config or your
+# MAGIC credentials. The Postgres data path (Leg B) only works from a **Dedicated /
+# MAGIC single-user** classic cluster (or serverless). This probe asks the Clusters
+# MAGIC API about this cluster (authoritative), falling back to Spark conf. If it
+# MAGIC warns, switch cluster access mode before debugging anything else.
 
 # COMMAND ----------
 
-mode = None
-for key in (
-    "spark.databricks.clusterUsageTags.clusterDataSecurityMode",
-    "spark.databricks.clusterUsageTags.dataSecurityMode",
-):
+def detect_access_mode():
+    """Return (mode, source). Prefer the Clusters API (authoritative); fall back
+    to Spark conf. Returns (None, reason) on serverless / when unavailable."""
+    # Authoritative: ask the Clusters API about THIS cluster, using the
+    # notebook's own context token against the local workspace.
     try:
-        mode = spark.conf.get(key)
-        if mode:
-            break
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        token = ctx.apiToken().get()
+        api_url = ctx.apiUrl().get()
+        cluster_id = spark.conf.get("spark.databricks.clusterUsageTags.clusterId")
+        if cluster_id:
+            r = requests.get(
+                f"{api_url}/api/2.0/clusters/get",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"cluster_id": cluster_id}, timeout=15,
+            )
+            if r.ok:
+                dsm = r.json().get("data_security_mode")
+                if dsm:
+                    return dsm, "clusters API"
     except Exception:
-        continue
+        pass
+    # Fallback: Spark conf (not always populated).
+    for key in ("spark.databricks.clusterUsageTags.clusterDataSecurityMode",
+                "spark.databricks.clusterUsageTags.dataSecurityMode"):
+        try:
+            v = spark.conf.get(key)
+            if v:
+                return v, "spark conf"
+        except Exception:
+            continue
+    return None, "no cluster_id (likely serverless)"
 
+# Modes that block arbitrary outbound sockets (incl. 5432) — "Standard"/Shared family.
+SHARED_MODES = {"USER_ISOLATION", "STANDARD", "DATA_SECURITY_MODE_STANDARD",
+                "LEGACY_TABLE_ACL", "LEGACY_PASSTHROUGH"}
+# Modes that permit outbound 5432 — "Dedicated"/Single-user family.
+DEDICATED_MODES = {"SINGLE_USER", "NONE", "DEDICATED", "DATA_SECURITY_MODE_DEDICATED",
+                   "LEGACY_SINGLE_USER", "LEGACY_SINGLE_USER_STANDARD"}
+
+mode, src = detect_access_mode()
 if mode is None:
     record("Cluster access mode", "B", "INFO",
-           "Could not read data security mode (may be serverless). If Leg B fails on 5432, confirm "
-           "you're not on a Shared cluster.")
-elif mode.upper() in ("USER_ISOLATION", "SHARED"):
+           f"Could not detect access mode ({src}). If Leg B fails on 5432, confirm you're not on a "
+           "Standard/Shared cluster.")
+elif mode.upper() in SHARED_MODES:
     record("Cluster access mode", "B", "WARN",
-           f"data_security_mode={mode} (Shared) — Shared classic clusters BLOCK outbound 5432 via "
-           "iptables. Leg B cannot work here. Re-run on a Dedicated/Single-user cluster or serverless.")
-else:
+           f"data_security_mode={mode} (Standard/Shared, via {src}) — Standard/Shared classic clusters "
+           "BLOCK outbound 5432. Leg B cannot work here. Re-run on a Dedicated/Single-user cluster "
+           "or serverless.")
+elif mode.upper() in DEDICATED_MODES:
     record("Cluster access mode", "B", "PASS",
-           f"data_security_mode={mode} — dedicated/single-user, outbound 5432 is permitted.")
+           f"data_security_mode={mode} (Dedicated/Single-user, via {src}) — outbound 5432 is permitted.")
+else:
+    record("Cluster access mode", "B", "INFO",
+           f"data_security_mode={mode} (via {src}) — unrecognized mode. If Leg B fails on 5432, "
+           "the cluster may be in a Standard/Shared family mode that blocks outbound sockets.")
 
 # COMMAND ----------
 
