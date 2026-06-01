@@ -382,8 +382,11 @@ else:
                     "Also check the workspace IP ACL (OAuth was not confirmed). ")
             record("Mint Lakebase DB credential", "A", "FAIL",
                    f"HTTP 403 on /api/2.0/postgres/credentials. {note}"
-                   f"Allowlisting the workspace IP ACL is necessary but may be INSUFFICIENT for this "
-                   f"endpoint. Escalate with request_id={cred_response_request_id or cred_request_id}. "
+                   f"Allowlisting the workspace IP ACL is necessary but INSUFFICIENT for this endpoint. "
+                   f"FIRST: check whether the TARGET workspace has a context-based ingress / serverless "
+                   f"network policy that this source isn't allowed under — diff it against a known-working "
+                   f"workspace. Only if the target has no such policy and it still 403s, escalate to "
+                   f"Databricks with request_id={cred_response_request_id or cred_request_id}. "
                    f"Body: {body_snip}",
                    error_class="LAKEBASE_CRED_403", latency_ms=lat)
         else:
@@ -577,9 +580,12 @@ if has("HTTP_403_IP_ACL"):
 if has("LAKEBASE_CRED_403"):
     diagnoses.append(f"• LAKEBASE NETWORK POLICY (not the workspace IP ACL) — /api/2.0/postgres/credentials "
                      f"returns 403 even though OAuth succeeded from this same IP ({egress_ip}). The credential "
-                     "endpoint enforces a Lakebase-specific network policy SEPARATE from the workspace IP "
-                     "access list, so allowlisting the workspace IP ACL is necessary but not sufficient. "
-                     "Capture the request_id above and escalate to Databricks. [NETWORKING.md → Other ingress controls]")
+                     "endpoint enforces a network policy SEPARATE from the workspace IP access list, so "
+                     "allowlisting the workspace IP ACL is necessary but not sufficient. "
+                     "FIRST STEP (self-service): check whether the TARGET workspace has a context-based "
+                     "ingress / serverless network policy this source isn't allowed under — diff it against a "
+                     "known-working workspace. Escalating to Databricks (with the request_id above) is the "
+                     "FALLBACK if the target has no such policy. [NETWORKING.md → Other ingress controls]")
 if has("HTTP_TIMEOUT") or has("HTTP_CONN_ERROR"):
     diagnoses.append("• LEG A BLOCKED — control-plane calls time out/reset. Either the Lakebase workspace has "
                      "front-end PrivateLink with public access disabled (and this VPC has no private route to "
