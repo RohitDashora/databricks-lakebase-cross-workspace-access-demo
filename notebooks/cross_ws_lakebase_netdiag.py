@@ -353,22 +353,42 @@ if not ws_token:
     record("Mint DB credential + resolve host", "A", "SKIP", "No workspace token from Probe 5.")
 else:
     # mint DB token
+    cred_request_id = str(uuid.uuid4())   # we generate it — useful for support escalation
+    cred_response_request_id = None
     t0 = time.time()
     try:
         r = requests.post(
             f"{LB_HOST}/api/2.0/postgres/credentials",
             headers={"Authorization": f"Bearer {ws_token}"},
-            json={"request_id": str(uuid.uuid4()), "endpoint": ENDPOINT},
+            json={"request_id": cred_request_id, "endpoint": ENDPOINT},
             timeout=20,
         )
         lat = int((time.time()-t0)*1000)
+        cred_response_request_id = r.headers.get("x-request-id") or r.headers.get("x-databricks-request-id")
+        body_snip = (r.text or "")[:300].replace("\n", " ")
         if r.status_code == 200 and r.json().get("token"):
             db_token = r.json()["token"]
             record("Mint Lakebase DB credential", "A", "PASS",
                    f"Got DB token (expire_time={r.json().get('expire_time')})", latency_ms=lat)
+        elif r.status_code == 403:
+            # IMPORTANT: a 403 HERE (not on OIDC) means the credential-mint endpoint enforces a
+            # Lakebase-specific network policy that is SEPARATE from the workspace IP access list.
+            # If OAuth (Probe 5) already passed from this same IP, the workspace IP ACL is NOT the gate.
+            oauth_ok = any(rr["step"] == "Mint workspace OAuth token" and rr["status"] == "PASS"
+                           for rr in RESULTS)
+            note = ("OAuth from this IP already succeeded, so the workspace IP ACL is NOT the blocker — "
+                    "the credential endpoint enforces a separate Lakebase network policy. "
+                    if oauth_ok else
+                    "Also check the workspace IP ACL (OAuth was not confirmed). ")
+            record("Mint Lakebase DB credential", "A", "FAIL",
+                   f"HTTP 403 on /api/2.0/postgres/credentials. {note}"
+                   f"Allowlisting the workspace IP ACL is necessary but may be INSUFFICIENT for this "
+                   f"endpoint. Escalate with request_id={cred_response_request_id or cred_request_id}. "
+                   f"Body: {body_snip}",
+                   error_class="LAKEBASE_CRED_403", latency_ms=lat)
         else:
             record("Mint Lakebase DB credential", "A", "FAIL",
-                   f"HTTP {r.status_code}: {(r.text or '')[:200]}",
+                   f"HTTP {r.status_code} (request_id={cred_response_request_id or cred_request_id}): {body_snip}",
                    error_class=f"HTTP_{r.status_code}", latency_ms=lat)
     except Exception as e:
         record("Mint Lakebase DB credential", "A", "FAIL", f"{type(e).__name__}: {e}",
@@ -416,6 +436,46 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Probe 7b — Leg A data API (`api.database.<region>`, 443)
+# MAGIC Separate from the workspace host: `api.database.*` backs the SQL Editor UI
+# MAGIC and table/branch metadata. It can be blocked independently of the 5432 data
+# MAGIC path — that's the difference between "SQL Editor broken but queries work"
+# MAGIC (Scenario 3) and "see tables but can't query" (Scenario 4). See NETWORKING.md.
+
+# COMMAND ----------
+
+if not db_host or ".database." not in db_host:
+    record("Leg A data API (api.database)", "A", "SKIP",
+           "DB host not resolved — can't derive the api.database.<region> host.")
+else:
+    api_host = "api.database." + db_host.split(".database.", 1)[1]
+    dns_probe("Resolve api.database host (Leg A)", "A", api_host)
+    if tcp_probe("TCP 443 to api.database", "A", api_host, 443):
+        t0 = time.time()
+        try:
+            r = requests.get(f"https://{api_host}/", timeout=15)
+            record("HTTP to api.database", "A", "PASS",
+                   f"HTTP {r.status_code} — data API reachable at the app layer",
+                   latency_ms=int((time.time()-t0)*1000))
+        except requests.exceptions.Timeout:
+            record("HTTP to api.database", "A", "FAIL",
+                   "Timed out on 443 to api.database — proxy/PL/firewall blocks the data API while "
+                   "5432 may be fine. Symptom: SQL Editor broken, notebook queries work (Scenario 3).",
+                   error_class="DATA_API_BLOCKED", latency_ms=int((time.time()-t0)*1000))
+        except requests.exceptions.ConnectionError as e:
+            record("HTTP to api.database", "A", "FAIL",
+                   f"Connection error to api.database: {e}", error_class="DATA_API_BLOCKED",
+                   latency_ms=int((time.time()-t0)*1000))
+    else:
+        # tcp_probe already recorded a TCP_* failure; flag the data-API meaning too.
+        record("api.database reachability", "A", "WARN",
+               "api.database.<region> unreachable on 443 — SQL Editor / metadata will fail even if "
+               "5432 works (Scenario 3). Allowlist api.database.<region> on 443.",
+               error_class="DATA_API_BLOCKED")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Probe 8 — Leg B app layer: psycopg2 connect + SELECT
 # MAGIC If Probe 7 passed but this fails with `password authentication failed`,
 # MAGIC **the network is fine** — it's the SP Postgres role / GRANTs (see the main
@@ -451,6 +511,16 @@ else:
                    "Postgres auth failed — NETWORK IS FINE. Fix is the SP Postgres role / GRANTs "
                    "(README gotchas #4, #5), not networking.",
                    error_class="PG_AUTH_FAILED", latency_ms=int((time.time()-t0)*1000))
+        elif "Invalid protocol version" in msg or "196608" in msg:
+            record("psycopg2 connect + SELECT", "B", "FAIL",
+                   "SSL was not negotiated — set sslmode=require. NETWORK IS FINE.",
+                   error_class="PG_SSL_DISABLED", latency_ms=int((time.time()-t0)*1000))
+        elif "Invalid authorization for databricks identity login" in msg:
+            record("psycopg2 connect + SELECT", "B", "FAIL",
+                   "Identity login rejected — OAuth token expired (~1h) or a group identity is being used "
+                   "on a dedicated cluster. Re-mint the token; ensure the cluster's single-user identity "
+                   "matches the SP/user that owns the Postgres role. NETWORK IS FINE.",
+                   error_class="PG_TOKEN_OR_IDENTITY", latency_ms=int((time.time()-t0)*1000))
         elif "timeout expired" in msg or "could not connect" in msg:
             record("psycopg2 connect + SELECT", "B", "FAIL",
                    f"Connection timeout/refused at psycopg2 layer despite TCP probe — TLS or mid-stream "
@@ -502,8 +572,14 @@ if has("DNS_NXDOMAIN"):
                      "(Route53 private hosted zone / Azure private DNS / GCP) for that destination. "
                      "[NETWORKING.md → DNS]")
 if has("HTTP_403_IP_ACL"):
-    diagnoses.append(f"• IP ACCESS LIST — Leg A returns 403. Add this cluster's egress IP ({egress_ip}) to the "
-                     "Lakebase workspace IP access list. [NETWORKING.md → IP access lists]")
+    diagnoses.append(f"• IP ACCESS LIST — the OIDC/well-known call returns 403. Add this cluster's egress IP "
+                     f"({egress_ip}) to the Lakebase workspace IP access list. [NETWORKING.md → IP access lists]")
+if has("LAKEBASE_CRED_403"):
+    diagnoses.append(f"• LAKEBASE NETWORK POLICY (not the workspace IP ACL) — /api/2.0/postgres/credentials "
+                     f"returns 403 even though OAuth succeeded from this same IP ({egress_ip}). The credential "
+                     "endpoint enforces a Lakebase-specific network policy SEPARATE from the workspace IP "
+                     "access list, so allowlisting the workspace IP ACL is necessary but not sufficient. "
+                     "Capture the request_id above and escalate to Databricks. [NETWORKING.md → Other ingress controls]")
 if has("HTTP_TIMEOUT") or has("HTTP_CONN_ERROR"):
     diagnoses.append("• LEG A BLOCKED — control-plane calls time out/reset. Either the Lakebase workspace has "
                      "front-end PrivateLink with public access disabled (and this VPC has no private route to "
@@ -512,10 +588,21 @@ if has("TCP_TIMEOUT") or has("TCP_REFUSED") or has("TCP_OSERROR"):
     diagnoses.append("• LEG B BLOCKED (port 5432) — the Postgres data path can't be reached. Most common cause: "
                      "egress firewall allows 443 but not 5432. Open egress to the DB endpoint host on 5432, or "
                      "set up a private endpoint for the database. [NETWORKING.md → Leg B / egress firewall]")
+if has("DATA_API_BLOCKED"):
+    diagnoses.append("• DATA API BLOCKED — api.database.<region> (443) is unreachable while the workspace host "
+                     "may be fine. SQL Editor / table metadata will fail even if 5432 queries work "
+                     "(Scenario 3). Allowlist api.database.<region> on 443. [NETWORKING.md → 4 scenarios]")
 if has("PG_SSL_ERROR"):
     diagnoses.append("• TLS INTERCEPTION — a forward proxy is breaking the Postgres SSL negotiation on 5432. "
                      "Postgres SSL can't be MITM'd like HTTPS; bypass the proxy for the DB endpoint. "
                      "[NETWORKING.md → proxies]")
+if has("PG_SSL_DISABLED"):
+    diagnoses.append("• SSL NOT NEGOTIATED — connection got an 'Invalid protocol version' error. "
+                     "Set sslmode=require. NETWORK IS FINE. [NETWORKING.md → signature table]")
+if has("PG_TOKEN_OR_IDENTITY"):
+    diagnoses.append("• TOKEN / IDENTITY — TCP 5432 connected; the DB token was expired (~1h) or a group "
+                     "identity was used on a dedicated cluster. Re-mint the token; check the cluster's "
+                     "single-user identity. NETWORK IS FINE. [NETWORKING.md → signature table]")
 if has("PG_AUTH_FAILED"):
     diagnoses.append("• NOT A NETWORK PROBLEM — TCP 5432 connected fine; Postgres rejected the credential. "
                      "This is the SP Postgres role / GRANT step, not networking. [README → gotchas #4, #5]")
@@ -540,5 +627,7 @@ print(f"Leg B (data path, 5432)    : {leg_status('B')}")
 
 dbutils.notebook.exit(json.dumps({
     "leg_a": leg_status("A"), "leg_b": leg_status("B"),
-    "egress_ip": egress_ip, "results": RESULTS,
+    "egress_ip": egress_ip,
+    "cred_mint_request_id": globals().get("cred_response_request_id") or globals().get("cred_request_id"),
+    "results": RESULTS,
 }, default=str))
