@@ -2,20 +2,11 @@
 
 Read a [Databricks Lakebase](https://docs.databricks.com/en/database/index.html)
 Postgres database that lives in one Databricks workspace from a
-**classic-compute notebook** running in a *different* workspace — no
-PrivateLink, no VPC peering, no Unity Catalog federation.
-
-Verified end-to-end on 2026-05-27:
-
-- **Lakebase workspace** holds the Lakebase autoscaling project; the production
-  branch must be in state `READY`.
-- **Compute workspace** runs the notebook on a classic cluster — tested on both
-  a job cluster and an interactive all-purpose cluster (DBR 15.4 LTS,
-  single-user, `i3.xlarge`, 1 worker).
-- Both workspaces in the same Databricks account, same AWS region.
-- The notebook authenticates as a service principal via OAuth m2m, mints a
-  Lakebase database credential, then connects with `psycopg2` and runs real
-  `SELECT`s.
+**classic-compute notebook** running in a *different* workspace — same
+Databricks account and region, no PrivateLink, no VPC peering, no Unity Catalog
+federation. The notebook authenticates as a service principal via OAuth m2m,
+mints a Lakebase database credential, then connects with `psycopg2` and runs
+real `SELECT`s.
 
 ## When to use this pattern
 
@@ -35,13 +26,13 @@ Verified end-to-end on 2026-05-27:
   doesn't apply; SP m2m OAuth is account-scoped.
 - For **strict-egress** environments where the compute cluster cannot reach
   `*.database.cloud.databricks.com` over the public internet — you'll need
-  PrivateLink + customer-managed networking instead.
+  PrivateLink + customer-managed networking. See **[NETWORKING.md](NETWORKING.md)**.
 
 ## Repo layout
 
 ```
 .
-├── README.md                              this file (overview + walkthrough)
+├── README.md                              this file (overview + quickstart)
 ├── NETWORKING.md                          locked-down networks: IP ACLs,
 │                                          PrivateLink, firewalls — diagnosis + fixes
 ├── LICENSE                                Apache 2.0
@@ -53,7 +44,189 @@ Verified end-to-end on 2026-05-27:
 
 ---
 
-## How the pieces fit together
+## Quickstart
+
+This is the simplest case: two **open** workspaces (no IP access lists,
+PrivateLink, or egress firewalls) in the same account and region, and a classic
+**single-user** cluster.
+
+### Prerequisites
+
+- Databricks CLI **v0.285.0+** (`databricks --version`).
+- CLI auth profiles for both workspaces:
+
+  ```bash
+  databricks auth login --host https://<lakebase-workspace> --profile lakebase-ws
+  databricks auth login --host https://<compute-workspace>  --profile compute-ws
+  ```
+
+- A Lakebase autoscaling project in `lakebase-ws` whose `production` branch is
+  in state `READY`:
+
+  ```bash
+  databricks postgres list-branches projects/<project-id> -p lakebase-ws -o json \
+    | jq '.[] | {name, state: .status.current_state}'
+  ```
+
+  > ⚠️ If the branch is `ARCHIVED`, this won't work without first restoring it.
+  > Pick another project or unarchive.
+
+### Step 1 — Create a service principal in the Lakebase workspace
+
+```bash
+# Substitute your own display name
+SP_NAME="cross-ws-lakebase-test"
+
+databricks service-principals create \
+  --json "{\"displayName\":\"$SP_NAME\",\"active\":true}" \
+  -p lakebase-ws -o json
+```
+
+Capture two fields from the response:
+
+- `applicationId` → this is the SP's **client_id** *and* its Postgres role name.
+- `id`            → the SCIM internal id; needed for the secret API.
+
+```bash
+SP_APP_ID=<applicationId>     # UUID, e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+SP_SCIM_ID=<id>               # 14-digit numeric, e.g. 12345678901234
+```
+
+### Step 2 — Generate a workspace OAuth secret for the SP
+
+```bash
+databricks service-principal-secrets-proxy create $SP_SCIM_ID -p lakebase-ws -o json
+```
+
+Capture the `secret` value — this is the **client_secret**. It cannot be
+re-displayed later, so store it now.
+
+> The endpoint is **`service-principal-secrets-proxy`**, not
+> `service-principal-secrets`. The latter is for account-level SPs.
+> The proxy command operates at the workspace level — required for workspace
+> OAuth flows. The CLI argument is the SCIM `id`, **not** the `applicationId`.
+
+### Step 3 — Provision the SP's Postgres role on the Lakebase branch
+
+This is the most easily-missed step. The OAuth credential mint API will hand
+out tokens for the SP even without this, but Postgres-level authentication will
+fail with `password authentication failed for user '<uuid>'` until the role
+exists on the branch.
+
+```bash
+databricks postgres create-role \
+  projects/<project-id>/branches/production \
+  --role-id "sp-cross-ws-test" \
+  --json "{\"spec\":{
+    \"identity_type\":\"SERVICE_PRINCIPAL\",
+    \"postgres_role\":\"$SP_APP_ID\",
+    \"auth_method\":\"LAKEBASE_OAUTH_V1\"
+  }}" \
+  -p lakebase-ws -o json
+```
+
+Then, as a project member who owns the schema/tables you want the SP to read,
+connect to the database and `GRANT` `CONNECT`/`USAGE`/`SELECT` to the SP's role
+(named by its `applicationId` UUID, double-quoted):
+
+```sql
+-- Connect to the target database as the project owner. Replace
+-- <your-database> with your DB name and $SP_APP_ID with the SP's applicationId
+-- (note the double quotes around the UUID — Postgres role names that look like
+-- UUIDs must be quoted).
+GRANT CONNECT ON DATABASE <your-database>   TO "$SP_APP_ID";
+GRANT USAGE   ON SCHEMA   public            TO "$SP_APP_ID";
+GRANT SELECT  ON ALL TABLES IN SCHEMA public TO "$SP_APP_ID";
+-- For future tables created later:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO "$SP_APP_ID";
+```
+
+### Step 4 — Stash SP creds in a secret scope in the compute workspace
+
+```bash
+SCOPE="cross-ws-lakebase"
+databricks secrets create-scope $SCOPE -p compute-ws
+
+databricks secrets put-secret $SCOPE sp_client_id            --string-value "$SP_APP_ID"          -p compute-ws
+databricks secrets put-secret $SCOPE sp_client_secret        --string-value "$SP_CLIENT_SECRET"   -p compute-ws
+databricks secrets put-secret $SCOPE lakebase_workspace_host --string-value "https://<lakebase-workspace-host>" -p compute-ws
+databricks secrets put-secret $SCOPE lakebase_endpoint       --string-value "projects/<project-id>/branches/production/endpoints/primary" -p compute-ws
+```
+
+### Step 5 — Run the notebook on classic compute
+
+Drop [`notebooks/cross_ws_lakebase_test.py`](notebooks/cross_ws_lakebase_test.py)
+into the compute workspace and attach to a classic **single-user** cluster (job
+or interactive, DBR 13+). The notebook is self-contained — it reads the four
+secrets from the scope above and runs the full flow end to end.
+
+Inline-condensed version for reference:
+
+```python
+# COMMAND ----------
+# MAGIC %pip install --quiet psycopg2-binary requests
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+import uuid, json, requests, psycopg2
+
+SCOPE = "cross-ws-lakebase"
+CLIENT_ID     = dbutils.secrets.get(SCOPE, "sp_client_id")
+CLIENT_SECRET = dbutils.secrets.get(SCOPE, "sp_client_secret")
+LB_HOST       = dbutils.secrets.get(SCOPE, "lakebase_workspace_host").rstrip("/")
+ENDPOINT      = dbutils.secrets.get(SCOPE, "lakebase_endpoint")
+
+# 1. m2m OAuth against the Lakebase workspace
+ws_token = requests.post(
+    f"{LB_HOST}/oidc/v1/token",
+    auth=(CLIENT_ID, CLIENT_SECRET),
+    data={"grant_type": "client_credentials", "scope": "all-apis"},
+    timeout=30,
+).json()["access_token"]
+
+# 2. Mint a Lakebase database credential
+db_token = requests.post(
+    f"{LB_HOST}/api/2.0/postgres/credentials",
+    headers={"Authorization": f"Bearer {ws_token}"},
+    json={"request_id": str(uuid.uuid4()), "endpoint": ENDPOINT},
+    timeout=30,
+).json()["token"]
+
+# 3. Resolve the endpoint host
+project, _, rest = ENDPOINT.removeprefix("projects/").partition("/branches/")
+branch,  _, _    = rest.partition("/endpoints/")
+endpoints = requests.get(
+    f"{LB_HOST}/api/2.0/postgres/projects/{project}/branches/{branch}/endpoints",
+    headers={"Authorization": f"Bearer {ws_token}"},
+    timeout=30,
+).json()["endpoints"]
+host = next(e["status"]["hosts"]["host"] for e in endpoints if e["name"] == ENDPOINT)
+
+# 4. Connect — user= is the SP's applicationId, password= is the DB token
+conn = psycopg2.connect(
+    host=host, port=5432, dbname="<your-database>",
+    user=CLIENT_ID, password=db_token,
+    sslmode="require", connect_timeout=20,
+)
+conn.autocommit = True
+with conn.cursor() as cur:
+    cur.execute("SELECT current_user, current_database(), version();")
+    print(cur.fetchone())
+    cur.execute("SELECT * FROM <your-table> LIMIT 5;")
+    for row in cur.fetchall():
+        print(row)
+conn.close()
+```
+
+---
+
+## How it actually works
+
+Now that you've run it, here's the conceptual model. The hop from the notebook
+to Postgres is direct over the public internet — no PrivateLink, no VPC peering,
+no special networking is needed for this specific flow (the Lakebase endpoint is
+reachable from any classic Databricks cluster with default egress).
 
 ```mermaid
 sequenceDiagram
@@ -83,19 +256,6 @@ sequenceDiagram
     NB->>PG: psycopg2.connect(host, port=5432,<br/>user=SP applicationId,<br/>password=DB token, sslmode=require)
     PG-->>NB: SELECT rows
 ```
-
-The hop from the notebook to Postgres is direct over the public internet — no
-PrivateLink, no VPC peering, no special networking is needed for this specific
-flow (the Lakebase endpoint is reachable from any classic Databricks cluster
-with default egress).
-
-> **Behind a firewall, IP access list, or PrivateLink?** That direct hop is
-> exactly what breaks. See **[NETWORKING.md](NETWORKING.md)** for the two-leg
-> model, the restriction→fix matrix, and a diagnostic notebook
-> (`notebooks/cross_ws_lakebase_netdiag.py`) that tells you which hop is failing
-> and why. One thing to know up front: the Postgres path is **TCP 5432** (not
-> 443), and **Shared-mode classic clusters block 5432** — use a dedicated /
-> single-user cluster.
 
 ### Credential mint chain
 
@@ -158,191 +318,12 @@ specific branch/endpoint, which is what shows up at the wire as the Postgres
 password. If you skip mint #2 and try to use the workspace access_token as the
 Postgres password, you get `password authentication failed`.
 
-**Practical implication.** For runs longer than ~1 hour, you can re-mint just
-the Lakebase DB token from a cached workspace access token until that one also
-expires; for very long-lived notebooks, wrap both mints in a refresh helper
-keyed off the response `expires_in`.
-
----
-
-## Prerequisites
-
-- Databricks CLI **v0.285.0+** (`databricks --version`).
-- CLI auth profiles for both workspaces:
-
-  ```bash
-  databricks auth login --host https://<lakebase-workspace> --profile lakebase-ws
-  databricks auth login --host https://<compute-workspace>  --profile compute-ws
-  ```
-
-- A Lakebase autoscaling project in `lakebase-ws` whose `production` branch is
-  in state `READY`:
-
-  ```bash
-  databricks postgres list-branches projects/<project-id> -p lakebase-ws -o json \
-    | jq '.[] | {name, state: .status.current_state}'
-  ```
-
-  > ⚠️ If the branch is `ARCHIVED`, this won't work without first restoring it.
-  > Pick another project or unarchive.
-
----
-
-## Step 1 — Create a service principal in the Lakebase workspace
-
-```bash
-# Substitute your own display name
-SP_NAME="cross-ws-lakebase-test"
-
-databricks service-principals create \
-  --json "{\"displayName\":\"$SP_NAME\",\"active\":true}" \
-  -p lakebase-ws -o json
-```
-
-Capture two fields from the response:
-
-- `applicationId` → this is the SP's **client_id** *and* its Postgres role name.
-- `id`            → the SCIM internal id; needed for the secret API.
-
-```bash
-SP_APP_ID=<applicationId>     # UUID, e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-SP_SCIM_ID=<id>               # 14-digit numeric, e.g. 12345678901234
-```
-
----
-
-## Step 2 — Generate a workspace OAuth secret for the SP
-
-```bash
-databricks service-principal-secrets-proxy create $SP_SCIM_ID -p lakebase-ws -o json
-```
-
-Capture the `secret` value — this is the **client_secret**. It cannot be
-re-displayed later, so store it now.
-
-> The endpoint is **`service-principal-secrets-proxy`**, not
-> `service-principal-secrets`. The latter is for account-level SPs.
-> The proxy command operates at the workspace level — required for workspace
-> OAuth flows. The CLI argument is the SCIM `id`, **not** the `applicationId`.
-
----
-
-## Step 3 — Provision the SP's Postgres role on the Lakebase branch
-
-This is the most easily-missed step. The OAuth credential mint API will hand
-out tokens for the SP even without this, but Postgres-level authentication will
-fail with `password authentication failed for user '<uuid>'` until the role
-exists on the branch.
-
-```bash
-databricks postgres create-role \
-  projects/<project-id>/branches/production \
-  --role-id "sp-cross-ws-test" \
-  --json "{\"spec\":{
-    \"identity_type\":\"SERVICE_PRINCIPAL\",
-    \"postgres_role\":\"$SP_APP_ID\",
-    \"auth_method\":\"LAKEBASE_OAUTH_V1\"
-  }}" \
-  -p lakebase-ws -o json
-```
-
-Then, as a project member who owns the schema/tables you want the SP to read,
-connect to the database and `GRANT` `CONNECT`/`USAGE`/`SELECT` to the SP's role
-(named by its `applicationId` UUID, double-quoted):
-
-```sql
--- Connect to the target database as the project owner. Replace
--- <your-database> with your DB name and $SP_APP_ID with the SP's applicationId
--- (note the double quotes around the UUID — Postgres role names that look like
--- UUIDs must be quoted).
-GRANT CONNECT ON DATABASE <your-database>   TO "$SP_APP_ID";
-GRANT USAGE   ON SCHEMA   public            TO "$SP_APP_ID";
-GRANT SELECT  ON ALL TABLES IN SCHEMA public TO "$SP_APP_ID";
--- For future tables created later:
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO "$SP_APP_ID";
-```
-
----
-
-## Step 4 — Stash SP creds in a secret scope in the compute workspace
-
-```bash
-SCOPE="cross-ws-lakebase"
-databricks secrets create-scope $SCOPE -p compute-ws
-
-databricks secrets put-secret $SCOPE sp_client_id            --string-value "$SP_APP_ID"          -p compute-ws
-databricks secrets put-secret $SCOPE sp_client_secret        --string-value "$SP_CLIENT_SECRET"   -p compute-ws
-databricks secrets put-secret $SCOPE lakebase_workspace_host --string-value "https://<lakebase-workspace-host>" -p compute-ws
-databricks secrets put-secret $SCOPE lakebase_endpoint       --string-value "projects/<project-id>/branches/production/endpoints/primary" -p compute-ws
-```
-
----
-
-## Step 5 — Run the notebook on classic compute
-
-Drop [`notebooks/cross_ws_lakebase_test.py`](notebooks/cross_ws_lakebase_test.py)
-into the compute workspace and attach to any classic cluster (job or
-interactive, single-user, DBR 13+). The notebook is self-contained — it reads
-the four secrets from the scope above and runs the full flow end to end.
-
-Inline-condensed version for reference:
-
-```python
-# COMMAND ----------
-# MAGIC %pip install --quiet psycopg2-binary requests
-# MAGIC dbutils.library.restartPython()
-
-# COMMAND ----------
-import uuid, json, requests, psycopg2
-
-SCOPE = "cross-ws-lakebase"
-CLIENT_ID     = dbutils.secrets.get(SCOPE, "sp_client_id")
-CLIENT_SECRET = dbutils.secrets.get(SCOPE, "sp_client_secret")
-LB_HOST       = dbutils.secrets.get(SCOPE, "lakebase_workspace_host").rstrip("/")
-ENDPOINT      = dbutils.secrets.get(SCOPE, "lakebase_endpoint")
-
-# 1. m2m OAuth against the Lakebase workspace
-ws_token = requests.post(
-    f"{LB_HOST}/oidc/v1/token",
-    auth=(CLIENT_ID, CLIENT_SECRET),
-    data={"grant_type": "client_credentials", "scope": "all-apis"},
-    timeout=30,
-).json()["access_token"]
-
-# 2. Mint a Lakebase database credential
-db_token = requests.post(
-    f"{LB_HOST}/api/2.0/postgres/credentials",
-    headers={"Authorization": f"Bearer {ws_token}"},
-    json={"request_id": str(uuid.uuid4()), "endpoint": ENDPOINT},
-    timeout=30,
-).json()["token"]
-
-# 3. Resolve the endpoint host
-project, _, rest = ENDPOINT.removeprefix("projects/").partition("/branches/")
-branch,  _, _    = rest.partition("/endpoints/")
-endpoints = requests.get(
-    f"{LB_HOST}/api/2.0/postgres/projects/{project}/branches/{branch}/endpoints",
-    headers={"Authorization": f"Bearer {ws_token}"},
-    timeout=30,
-).json()["endpoints"]
-host = next(e["status"]["hosts"]["host"] for e in endpoints if e["name"] == ENDPOINT)
-
-# 4. Connect — user= is the SP's applicationId, password= is the DB token
-conn = psycopg2.connect(
-    host=host, port=5432, dbname="<your-database>",
-    user=CLIENT_ID, password=db_token,
-    sslmode="require", connect_timeout=20,
-)
-conn.autocommit = True
-with conn.cursor() as cur:
-    cur.execute("SELECT current_user, current_database(), version();")
-    print(cur.fetchone())
-    cur.execute("SELECT * FROM <your-table> LIMIT 5;")
-    for row in cur.fetchall():
-        print(row)
-conn.close()
-```
+**Auth vs network are different layers.** Everything above is the *auth* layer
+(who you are and what you're allowed to read). Reaching the endpoint at all —
+TCP to `ep-*:5432`, then TLS — is the *network* layer. In an open workspace
+they both just work; behind IP ACLs, PrivateLink, or firewalls the network
+layer is what breaks first. The deep network model lives in
+**[NETWORKING.md](NETWORKING.md)**.
 
 ---
 
@@ -360,7 +341,9 @@ conn.close()
 
 ---
 
-## Token lifetimes
+## Reference
+
+### Token lifetimes
 
 | Token | Lifetime | Notes |
 |-------|----------|-------|
@@ -371,9 +354,7 @@ conn.close()
 For multi-hour workloads, wrap the mint logic in a retry / refresh loop or
 re-execute steps 1-2 just before each long query.
 
----
-
-## Cleanup
+### Cleanup
 
 ```bash
 # Compute workspace
@@ -394,9 +375,7 @@ default but you can force it):
 databricks clusters delete <cluster-id> -p compute-ws
 ```
 
----
-
-## Reproduction template
+### Reproduction template
 
 Fill these in for your own pair of workspaces. Keep the *shape* — the names on
 the left match the secret-scope keys and CLI flags used throughout this guide.
@@ -415,12 +394,29 @@ the left match the secret-scope keys and CLI flags used throughout this guide.
 | Secret scope (compute workspace) | `cross-ws-lakebase` | `databricks secrets create-scope` |
 | Notebook path (compute workspace) | `/Users/<you>/cross_ws_lakebase_test` | Wherever you put the notebook in your workspace |
 
-This guide was verified on:
+### Verified on
 
 - Databricks CLI v0.298.0
 - DBR 15.4 LTS (Spark 3.5.0, Scala 2.12)
 - Node type `i3.xlarge`, 1 worker, single-user mode
 - Both classic compute flavors: one-shot job cluster and interactive all-purpose cluster
+
+---
+
+## Next level → NETWORKING.md
+
+The quickstart assumes two open workspaces. Behind **IP access lists**,
+**PrivateLink**, or **egress firewalls**, that direct public hop is exactly what
+breaks. **[NETWORKING.md](NETWORKING.md)** has the two-leg network model, the
+restriction→diagnosis→fix matrix, and a diagnostic notebook
+(`notebooks/cross_ws_lakebase_netdiag.py`) that tells you which hop is failing
+and why.
+
+Two things to know up front:
+
+- The Postgres path is **TCP 5432**, not 443.
+- **Shared-mode classic clusters block outbound 5432** — use a Dedicated /
+  single-user cluster (or serverless).
 
 ---
 

@@ -24,3 +24,6 @@ venv/
 secrets.json
 *.tfstate
 *.tfstate.backup
+
+# GOTM working ledger (not part of the deliverable)
+.gotm/
