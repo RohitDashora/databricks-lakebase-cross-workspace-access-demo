@@ -156,19 +156,45 @@ independently block traffic that the IP ACL would otherwise allow. If Leg A/B is
 reachable at the network layer but still rejected, check this in addition to the
 IP ACL. Docs: [Context-based ingress](https://docs.databricks.com/aws/en/security/network/front-end/context-based-ingress).
 
-> **Field-observed: the credential-mint endpoint has its own gate.** In a real
-> restricted environment, the cluster's egress IP was **already allowlisted in
-> the workspace IP access list** and `/oidc/v1/token` succeeded from that IP —
-> yet `POST /api/2.0/postgres/credentials` returned **HTTP 403 "Unauthorized
-> network access to workspace `<id>`"**. The same IP passed the OAuth call moments
-> earlier. Takeaway: **the workspace IP ACL is necessary but not sufficient** —
-> the Lakebase credential endpoint enforces an additional network policy that the
-> workspace-level IP ACL does not cover. The diagnostic flags this distinctly as
-> `LAKEBASE_CRED_403` (vs `HTTP_403_IP_ACL` on the OIDC call) and captures the
-> `request_id` for escalation. Root cause is under Databricks investigation; if
-> you hit this, open a support case with the `request_id` and ask whether the
-> credential endpoint enforces a per-instance/per-project network policy beyond
-> the workspace IP ACL.
+> **Field-observed: OIDC works but the Lakebase plane is refused.** In a real
+> restricted environment the cluster's egress IP was **allowlisted in the
+> workspace IP access list**, **public access was enabled**, context-based
+> ingress was **disabled**, and `/oidc/v1/token` **succeeded** from that IP — yet
+> `POST /api/2.0/postgres/credentials` returned **403 "Unauthorized network
+> access to workspace `<id>`"**.
+>
+> **Why:** the target had **front-end PrivateLink** enabled. `public access
+> enabled` covers only the **front-end connection (web/REST/OIDC)** — which is why
+> the token mint worked. The **Lakebase plane** (`api.database.*` / `ep-*`) rides
+> the **Service-Direct (performance-intensive services)** endpoint, which a
+> PrivateLink workspace *also* requires; with it missing/unrouted, the public
+> path to Lakebase is refused. A no-PL workspace (like our control) serves the
+> Lakebase plane publicly, so it works.
+>
+> **Fix:** set up the **Service-Direct** inbound PL endpoint and route the caller
+> through it (see recipe 3) — not an allowlist entry. **Escalate only if** the
+> target already has Service-Direct registered and it still 403s (then all
+> documented controls are satisfied — use the captured `request_id`). The
+> diagnostic flags this as `LAKEBASE_CRED_403` (vs `HTTP_403_IP_ACL` on OIDC).
+
+```mermaid
+flowchart TB
+    NB["Caller — classic cluster, public egress
+    IP allowlisted, public access enabled"]
+    WEB["Workspace front door 443
+    public + IP ACL -> ALLOWED"]
+    LB["Lakebase plane (api.database / ep-*)
+    front-end PL ON -> needs Service-Direct
+    Service-Direct missing"]
+    NB -->|"OIDC / token mint (443)"| WEB
+    WEB -.->|"PASS"| NB
+    NB -->|"credential mint / Postgres"| LB
+    LB -.->|"403 Unauthorized network access"| NB
+    classDef ok fill:#e6f4ea,stroke:#2e7d32,color:#0a3f17
+    classDef bad fill:#fdecea,stroke:#c62828,color:#5a1414
+    class WEB ok
+    class LB bad
+```
 
 ---
 
@@ -252,6 +278,55 @@ To carry the **5432 data path** privately (no internet), Lakebase Autoscaling
 uses **Service-Direct PrivateLink** ("inbound Private Link for performance-
 intensive services") — a **separate** inbound endpoint from classic front-end
 PrivateLink, and **not** an NCC rule.
+
+**The two-endpoint model.** A PrivateLink workspace needs **both** inbound
+endpoints, and they carry different traffic. The front-end PL endpoint carries
+the workspace front door (web/REST/OIDC); the **Service-Direct** endpoint carries
+the entire Lakebase plane — **both `api.database.<region>` (443) and
+`ep-*.database.<region>` (5432)**. Miss the Service-Direct endpoint and the
+Lakebase plane is unreachable even though OIDC over the front door still works.
+
+```mermaid
+flowchart TB
+    NB["Notebook / driver
+    classic single-user cluster
+    in caller VPC"]
+    subgraph TRANSIT["Transit VPC (separate from workspace VPC, supported AZ)"]
+      FE["VPC interface endpoint
+      Front-end PrivateLink
+      (API access)"]
+      SD["VPC interface endpoint
+      Service-Direct
+      (performance-intensive services)"]
+    end
+    subgraph CP["Databricks control plane"]
+      WEB["Workspace front door
+      WS.cloud.databricks.com : 443
+      web app, REST APIs, OIDC token"]
+      LB["Lakebase Autoscaling plane
+      api.database.REGION : 443 (mgmt + credential)
+      ep-NAME.database.REGION : 5432 (Postgres)"]
+    end
+    NB -->|"OIDC + workspace REST (443)"| FE
+    FE --> WEB
+    NB -->|"api.database 443 + Postgres 5432"| SD
+    SD --> LB
+    classDef pl fill:#e6f4ea,stroke:#2e7d32,stroke-width:2px,color:#0a3f17
+    classDef cp fill:#eef2ff,stroke:#3949ab,stroke-width:2px,color:#1a237e
+    class FE,SD pl
+    class WEB,LB cp
+```
+
+**DNS chain** — `api.database.<region>` resolves *through* the Service-Direct
+endpoint (this is why that endpoint carries the management/credential calls too):
+
+```mermaid
+flowchart LR
+    A["api.database.REGION.cloud.databricks.com"] -->|CNAME| B["REGION.service-direct.privatelink.cloud.databricks.com"]
+    B -->|"A record, set AFTER registration"| C["private IP of the Service-Direct VPC endpoint"]
+```
+
+**Per-subnet/SG hop view** (what each network layer must allow):
 
 ```mermaid
 flowchart TB
