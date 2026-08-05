@@ -28,6 +28,22 @@ import json
 import requests
 import psycopg2
 
+
+def raise_with_reason(resp, step):
+    """Like raise_for_status(), but keeps the X-Databricks-Reason-Phrase header.
+
+    A 403 from Databricks carries that header naming which ingress control rejected
+    the call (IP access list vs PrivateLink vs public-access). raise_for_status()
+    discards it, leaving a bare "403 Client Error: Forbidden" that can't be acted on.
+    Run cross_ws_lakebase_netdiag.py for the full breakdown.
+    """
+    if resp.ok:
+        return resp
+    phrase = resp.headers.get("X-Databricks-Reason-Phrase") or (resp.text or "")[:300]
+    req_id = resp.headers.get("x-request-id") or resp.headers.get("x-databricks-request-id")
+    suffix = f" (request_id={req_id})" if req_id else ""
+    raise RuntimeError(f"{step}: HTTP {resp.status_code}: {phrase}{suffix}")
+
 SCOPE = "cross-ws-lakebase"
 CLIENT_ID                = dbutils.secrets.get(SCOPE, "sp_client_id")
 CLIENT_SECRET            = dbutils.secrets.get(SCOPE, "sp_client_secret")
@@ -47,7 +63,7 @@ oauth_resp = requests.post(
     data={"grant_type": "client_credentials", "scope": "all-apis"},
     timeout=30,
 )
-oauth_resp.raise_for_status()
+raise_with_reason(oauth_resp, "POST /oidc/v1/token")
 ws_token = oauth_resp.json()["access_token"]
 print(f"Workspace OAuth token: len={len(ws_token)}, expires_in={oauth_resp.json()['expires_in']}s")
 
@@ -66,7 +82,7 @@ cred_resp = requests.post(
     },
     timeout=30,
 )
-cred_resp.raise_for_status()
+raise_with_reason(cred_resp, "POST /api/2.0/postgres/credentials")
 db_token = cred_resp.json()["token"]
 print(f"Lakebase DB token: len={len(db_token)}, expire_time={cred_resp.json().get('expire_time')}")
 
@@ -82,7 +98,7 @@ list_resp = requests.get(
     headers={"Authorization": f"Bearer {ws_token}"},
     timeout=30,
 )
-list_resp.raise_for_status()
+raise_with_reason(list_resp, "GET .../branches/<branch>/endpoints")
 endpoints = list_resp.json().get("endpoints", [])
 host = next(e["status"]["hosts"]["host"] for e in endpoints if e["name"] == ENDPOINT_PATH)
 print(f"Lakebase host: {host}")

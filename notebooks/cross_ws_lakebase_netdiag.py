@@ -41,6 +41,9 @@ import requests
 dbutils.widgets.text("lakebase_workspace_host", "", "Lakebase workspace host (https://...)")
 dbutils.widgets.text("lakebase_endpoint", "", "Endpoint (projects/<P>/branches/<B>/endpoints/<E>)")
 dbutils.widgets.text("secret_scope", "cross-ws-lakebase", "Secret scope name")
+# Optional escape hatch: if endpoint-host discovery is blocked, paste the known
+# ep-*.database.<region>... hostname here to test the Postgres data path regardless.
+dbutils.widgets.text("db_host_override", "", "DB host override (optional)")
 
 SCOPE = dbutils.widgets.get("secret_scope").strip()
 
@@ -63,6 +66,7 @@ CLIENT_ID   = _secret_only("sp_client_id")
 CLIENT_SECRET = _secret_only("sp_client_secret")
 LB_HOST     = _secret_or_widget("lakebase_workspace_host", "lakebase_workspace_host").rstrip("/")
 ENDPOINT    = _secret_or_widget("lakebase_endpoint", "lakebase_endpoint")
+DB_HOST_OVERRIDE = dbutils.widgets.get("db_host_override").strip()
 
 HAVE_CREDS = bool(CLIENT_ID and CLIENT_SECRET)
 
@@ -95,6 +99,110 @@ def record(step, leg, status, detail="", error_class="", latency_ms=None):
     print(f"{tag} [{leg}] {step}: {status}{ec}{lat}")
     if detail:
         print(f"      {detail}")
+
+def reason_phrase(resp):
+    """Return Databricks' network-rejection reason, or None.
+
+    A 403 from a Databricks front door carries `X-Databricks-Reason-Phrase`, which
+    names the ingress layer that rejected the call. `raise_for_status()` discards it,
+    which is why a bare "403 Client Error: Forbidden" is not actionable. Some proxies
+    surface the same string in the body instead, so check both.
+    """
+    rp = resp.headers.get("X-Databricks-Reason-Phrase")
+    if rp:
+        return rp.strip()
+    body = (resp.text or "").strip()
+    if not body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body[:300]
+    if isinstance(parsed, dict):
+        for k in ("X-Databricks-Reason-Phrase", "message", "error_description", "error"):
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return body[:300]
+
+
+def ingress_layer(phrase):
+    """Map a reason phrase to the ingress control that rejected the request.
+
+    Returns (code, explanation) or (None, None) when the phrase names no known
+    network layer -- which is itself informative: a 403 with no network reason is
+    shaped like an authorization failure, not a network block.
+    """
+    p = (phrase or "").lower()
+    if "private link" in p or "privatelink" in p:
+        return ("PL_INGRESS", (
+            "PrivateLink ingress: the target workspace only accepts traffic from "
+            "registered private endpoints, and the endpoint this request arrived on "
+            "is not on its allowlist. Adding public/NAT IPs to the target's IP "
+            "access list cannot fix this."))
+    if "public access is not allowed" in p:
+        return ("PUBLIC_ACCESS_DISABLED", (
+            "The target workspace has public access disabled, so it requires a "
+            "private path. This request arrived over the public route."))
+    if "ip acl" in p or "network access" in p or "is blocked by databricks" in p:
+        return ("IP_ACL", (
+            "IP access list: the source egress IP is not allow-listed on the target "
+            "workspace. Compare the egress IP from Probe 1 against its IP ACL."))
+    return (None, None)
+
+
+def http_probe(step, leg, method, url, expect_json_key=None, **kw):
+    """Issue one HTTP call and record status + reason phrase. Never raises.
+
+    Returns (response_or_None, parsed_json_or_None).
+    """
+    kw.setdefault("timeout", 20)
+    t0 = time.time()
+    try:
+        resp = requests.request(method, url, **kw)
+    except requests.exceptions.Timeout:
+        record(step, leg, "FAIL", f"Timed out after {kw['timeout']}s: {method} {url}",
+               error_class="HTTP_TIMEOUT", latency_ms=int((time.time()-t0)*1000))
+        return None, None
+    except requests.exceptions.ConnectionError as e:
+        record(step, leg, "FAIL", f"Connection error: {e}", error_class="HTTP_CONN_ERROR",
+               latency_ms=int((time.time()-t0)*1000))
+        return None, None
+    except Exception as e:
+        record(step, leg, "FAIL", f"{type(e).__name__}: {e}", error_class="HTTP_EXCEPTION",
+               latency_ms=int((time.time()-t0)*1000))
+        return None, None
+
+    lat = int((time.time()-t0)*1000)
+    req_id = resp.headers.get("x-request-id") or resp.headers.get("x-databricks-request-id")
+    phrase = reason_phrase(resp)
+
+    if resp.ok:
+        parsed = None
+        if expect_json_key:
+            try:
+                parsed = resp.json()
+            except ValueError:
+                record(step, leg, "FAIL", f"HTTP {resp.status_code} but body was not JSON",
+                       error_class="BAD_RESPONSE", latency_ms=lat)
+                return resp, None
+        return resp, parsed
+
+    layer, explain = ingress_layer(phrase)
+    bits = [f"HTTP {resp.status_code} on {method} {url}"]
+    bits.append(f"reason phrase: {phrase}" if phrase else "no X-Databricks-Reason-Phrase header")
+    if explain:
+        bits.append(explain)
+    elif resp.status_code == 403:
+        bits.append("No network reason phrase, so this 403 is shaped like an authorization "
+                    "failure rather than a network block -- check the service principal's "
+                    "permissions on this Lakebase project/branch before investigating the network.")
+    if req_id:
+        bits.append(f"request_id={req_id} (quote this in a support case)")
+    record(step, leg, "FAIL", " | ".join(bits),
+           error_class=layer or f"HTTP_{resp.status_code}", latency_ms=lat)
+    return resp, None
+
 
 def classify_ip(ip):
     try:
@@ -240,13 +348,56 @@ if not egress_ip:
 # MAGIC ## Probe 2 — DNS resolution (both hosts)
 # MAGIC Private IPs here mean PrivateLink/private DNS is in effect; NXDOMAIN means
 # MAGIC DNS isn't wired up for that destination.
+# MAGIC
+# MAGIC **Why this matters for cross-workspace:** PrivateLink DNS is *regional*, not
+# MAGIC per-workspace. If this compute sits in a VPC wired for PrivateLink, the target
+# MAGIC workspace's hostname resolves to **your** VPC endpoint — so the request reaches
+# MAGIC the target over PrivateLink and never egresses via your NAT gateway. The target
+# MAGIC then authorizes it against its *registered endpoint* allowlist, not its IP
+# MAGIC access list. That is why allow-listing NAT IPs has no effect in this topology.
 
 # COMMAND ----------
 
-dns_probe("Resolve workspace host (Leg A)", "A", LB_HOSTNAME)
+ws_ips, ws_kinds = dns_probe("Resolve workspace host (Leg A)", "A", LB_HOSTNAME)
 
-# We don't know the DB host yet (it comes from Leg A), but if the basic notebook
-# already told you the host, you can probe it here. Otherwise Probe 6 resolves it.
+if "private" in ws_kinds:
+    record("Path the target sees", "A", "INFO",
+           "Workspace host resolves to a PRIVATE address, so this request arrives over "
+           "PrivateLink. Authorization is decided by the target's registered private "
+           "endpoints -- its IP access list is not consulted for this path.")
+elif "public" in ws_kinds:
+    record("Path the target sees", "A", "INFO",
+           "Workspace host resolves to a PUBLIC address, so this request egresses via "
+           "NAT/internet. The target's IP access list (and its public-access setting) "
+           "govern whether it is allowed.")
+
+# Service-Direct PrivateLink backs the Lakebase database path specifically, and is a
+# SEPARATE endpoint from classic front-end workspace PrivateLink. When it is missing or
+# its DNS is unwired, database traffic silently falls back to the public route.
+if DB_HOST_OVERRIDE or LB_HOSTNAME.count(".") >= 2:
+    region_guess = ""
+    if DB_HOST_OVERRIDE and ".database." in DB_HOST_OVERRIDE:
+        region_guess = DB_HOST_OVERRIDE.split(".database.", 1)[1].split(".", 1)[0]
+    if region_guess:
+        tld = "azuredatabricks.net" if "azuredatabricks" in LB_HOSTNAME else "cloud.databricks.com"
+        sd_pl = f"{region_guess}.service-direct.privatelink.{tld}"
+        # NXDOMAIN here is EXPECTED on a public-path setup, so this is informational
+        # rather than a failure -- it only matters when the target requires a private
+        # path (i.e. alongside a PL_INGRESS or PUBLIC_ACCESS_DISABLED rejection).
+        try:
+            _sd_ips = sorted({i[4][0] for i in socket.getaddrinfo(sd_pl, None)})
+            record(f"Service-direct PL DNS ({region_guess})", "A", "INFO",
+                   f"{sd_pl} resolves to {', '.join(_sd_ips)} "
+                   f"({'private -- service-direct PL is wired up' if any(classify_ip(i) == 'private' for i in _sd_ips) else 'public'})")
+        except socket.gaierror:
+            record(f"Service-direct PL DNS ({region_guess})", "A", "INFO",
+                   f"{sd_pl} does not resolve. Expected on a public-path setup. If the "
+                   f"target requires a private path for the database plane, this DNS "
+                   f"record (and the service-direct endpoint) is what is missing.")
+    else:
+        record("Service-direct PL DNS", "A", "SKIP",
+               "Set DB_HOST_OVERRIDE (or let Probe 6 resolve the DB host) to derive the "
+               "region and check the service-direct PrivateLink DNS chain.")
 
 # COMMAND ----------
 
@@ -276,9 +427,12 @@ try:
         record("HTTP GET oidc well-known", "A", "PASS",
                f"HTTP 200 — workspace front door is reachable at the app layer", latency_ms=lat)
     elif r.status_code == 403:
+        _phrase = reason_phrase(r)
+        _layer, _explain = ingress_layer(_phrase)
         record("HTTP GET oidc well-known", "A", "FAIL",
-               f"HTTP 403 — likely IP access list blocking this source IP ({egress_ip}). Body: {body_snip}",
-               error_class="HTTP_403_IP_ACL", latency_ms=lat)
+               f"HTTP 403. reason phrase: {_phrase or 'none'}. "
+               + (_explain or f"No network reason phrase; source IP seen as {egress_ip}."),
+               error_class=_layer or "HTTP_403", latency_ms=lat)
     else:
         record("HTTP GET oidc well-known", "A", "WARN",
                f"HTTP {r.status_code} (network reachable). Body: {body_snip}",
@@ -325,9 +479,12 @@ else:
                    f"and that the SP exists in the Lakebase workspace. Body: {(r.text or '')[:200]}",
                    error_class="OAUTH_BAD_CREDS", latency_ms=lat)
         elif r.status_code == 403:
+            _phrase = reason_phrase(r)
+            _layer, _explain = ingress_layer(_phrase)
             record("Mint workspace OAuth token", "A", "FAIL",
-                   f"HTTP 403 — IP access list blocking source IP {egress_ip}.",
-                   error_class="HTTP_403_IP_ACL", latency_ms=lat)
+                   f"HTTP 403. reason phrase: {_phrase or 'none'}. "
+                   + (_explain or f"No network reason phrase; source IP seen as {egress_ip}."),
+                   error_class=_layer or "HTTP_403", latency_ms=lat)
         else:
             record("Mint workspace OAuth token", "A", "FAIL",
                    f"HTTP {r.status_code}: {(r.text or '')[:200]}",
@@ -349,73 +506,68 @@ else:
 
 db_token = None
 db_host = None
-if not ws_token:
-    record("Mint DB credential + resolve host", "A", "SKIP", "No workspace token from Probe 5.")
-else:
-    # mint DB token
-    cred_request_id = str(uuid.uuid4())   # we generate it — useful for support escalation
-    cred_response_request_id = None
-    t0 = time.time()
-    try:
-        r = requests.post(
-            f"{LB_HOST}/api/2.0/postgres/credentials",
-            headers={"Authorization": f"Bearer {ws_token}"},
-            json={"request_id": cred_request_id, "endpoint": ENDPOINT},
-            timeout=20,
-        )
-        lat = int((time.time()-t0)*1000)
-        cred_response_request_id = r.headers.get("x-request-id") or r.headers.get("x-databricks-request-id")
-        body_snip = (r.text or "")[:300].replace("\n", " ")
-        if r.status_code == 200 and r.json().get("token"):
-            db_token = r.json()["token"]
-            record("Mint Lakebase DB credential", "A", "PASS",
-                   f"Got DB token (expire_time={r.json().get('expire_time')})", latency_ms=lat)
-        elif r.status_code == 403:
-            # IMPORTANT: a 403 HERE (not on OIDC) means the credential-mint endpoint enforces a
-            # Lakebase-specific network policy that is SEPARATE from the workspace IP access list.
-            # If OAuth (Probe 5) already passed from this same IP, the workspace IP ACL is NOT the gate.
-            oauth_ok = any(rr["step"] == "Mint workspace OAuth token" and rr["status"] == "PASS"
-                           for rr in RESULTS)
-            note = ("OAuth from this IP already succeeded, so the workspace IP ACL is NOT the blocker — "
-                    "the credential endpoint enforces a separate Lakebase network policy. "
-                    if oauth_ok else
-                    "Also check the workspace IP ACL (OAuth was not confirmed). ")
-            record("Mint Lakebase DB credential", "A", "FAIL",
-                   f"HTTP 403 on /api/2.0/postgres/credentials. {note}"
-                   f"Allowlisting the workspace IP ACL is necessary but INSUFFICIENT for this endpoint. "
-                   f"FIRST: check whether the TARGET workspace has a context-based ingress / serverless "
-                   f"network policy that this source isn't allowed under — diff it against a known-working "
-                   f"workspace. Only if the target has no such policy and it still 403s, escalate to "
-                   f"Databricks with request_id={cred_response_request_id or cred_request_id}. "
-                   f"Body: {body_snip}",
-                   error_class="LAKEBASE_CRED_403", latency_ms=lat)
-        else:
-            record("Mint Lakebase DB credential", "A", "FAIL",
-                   f"HTTP {r.status_code} (request_id={cred_response_request_id or cred_request_id}): {body_snip}",
-                   error_class=f"HTTP_{r.status_code}", latency_ms=lat)
-    except Exception as e:
-        record("Mint Lakebase DB credential", "A", "FAIL", f"{type(e).__name__}: {e}",
-               error_class="HTTP_EXCEPTION")
 
-    # resolve host
-    if db_token is not None:
-        project, _, rest = ENDPOINT.removeprefix("projects/").partition("/branches/")
-        branch, _, _ = rest.partition("/endpoints/")
-        t0 = time.time()
+if not ws_token:
+    record("Mint DB credential", "A", "SKIP", "No workspace token from Probe 5.")
+else:
+    # We generate request_id ourselves, so it is quotable in a support case even if
+    # the response never arrives.
+    cred_request_id = str(uuid.uuid4())
+    r, parsed = http_probe(
+        "Mint Lakebase DB credential", "A", "POST",
+        f"{LB_HOST}/api/2.0/postgres/credentials",
+        headers={"Authorization": f"Bearer {ws_token}"},
+        json={"request_id": cred_request_id, "endpoint": ENDPOINT},
+        expect_json_key="token",
+    )
+    if parsed and parsed.get("token"):
+        db_token = parsed["token"]
+        record("Mint Lakebase DB credential", "A", "PASS",
+               f"Got DB token (expire_time={parsed.get('expire_time')})")
+    elif r is not None and r.ok:
+        record("Mint Lakebase DB credential", "A", "FAIL",
+               f"HTTP {r.status_code} but no token in response body.",
+               error_class="BAD_RESPONSE")
+
+# Endpoint-host discovery is a CONVENIENCE hop, not part of the data path. It is
+# attempted whenever we have a workspace token -- it does not need the DB token --
+# and a failure here must not skip Leg B. DB_HOST_OVERRIDE supplies the hostname when
+# this fails, but does NOT suppress the probe: the rejection it surfaces is evidence.
+if not ws_token:
+    record("Resolve endpoint host", "A", "SKIP", "No workspace token from Probe 5.")
+else:
+    # Always attempt discovery, even when DB_HOST_OVERRIDE is set: this call is one of
+    # the most reliable places to observe an ingress rejection, so skipping it would
+    # hide the very evidence (the reason phrase) that names the blocking layer.
+    project, _, rest = ENDPOINT.removeprefix("projects/").partition("/branches/")
+    branch, _, _ = rest.partition("/endpoints/")
+    r, parsed = http_probe(
+        "Resolve endpoint host", "A", "GET",
+        f"{LB_HOST}/api/2.0/postgres/projects/{project}/branches/{branch}/endpoints",
+        headers={"Authorization": f"Bearer {ws_token}"},
+        expect_json_key="endpoints",
+    )
+    if parsed is not None:
         try:
-            r = requests.get(
-                f"{LB_HOST}/api/2.0/postgres/projects/{project}/branches/{branch}/endpoints",
-                headers={"Authorization": f"Bearer {ws_token}"},
-                timeout=20,
-            )
-            r.raise_for_status()
-            eps = r.json().get("endpoints", [])
-            db_host = next(e["status"]["hosts"]["host"] for e in eps if e["name"] == ENDPOINT)
-            record("Resolve endpoint host", "A", "PASS", f"DB host = {db_host}",
-                   latency_ms=int((time.time()-t0)*1000))
-        except Exception as e:
-            record("Resolve endpoint host", "A", "FAIL", f"{type(e).__name__}: {e}",
-                   error_class="HTTP_EXCEPTION")
+            db_host = next(e["status"]["hosts"]["host"]
+                           for e in parsed.get("endpoints", [])
+                           if e["name"] == ENDPOINT)
+            record("Resolve endpoint host", "A", "PASS", f"DB host = {db_host}")
+        except StopIteration:
+            record("Resolve endpoint host", "A", "FAIL",
+                   f"No endpoint named {ENDPOINT} in the response. Check the endpoint path, "
+                   f"or set DB_HOST_OVERRIDE to test the data path directly.",
+                   error_class="ENDPOINT_NOT_FOUND")
+    elif r is not None and not r.ok:
+        record("Resolve endpoint host", "A", "WARN",
+               "Discovery failed, but this only finds the hostname -- it is not on the data "
+               "path. Set DB_HOST_OVERRIDE (ep-*.database.<region>...) to test Leg B anyway.")
+
+# Fall back to the override so a discovery failure never blocks Leg B.
+if not db_host and DB_HOST_OVERRIDE:
+    db_host = DB_HOST_OVERRIDE
+    record("DB host source", "A", "INFO",
+           f"Using DB_HOST_OVERRIDE = {db_host} (discovery did not yield a host).")
 
 # COMMAND ----------
 
@@ -574,18 +726,33 @@ if has("DNS_NXDOMAIN"):
     diagnoses.append("• DNS_NXDOMAIN — a hostname won't resolve. Under PrivateLink you need private DNS "
                      "(Route53 private hosted zone / Azure private DNS / GCP) for that destination. "
                      "[NETWORKING.md → DNS]")
-if has("HTTP_403_IP_ACL"):
-    diagnoses.append(f"• IP ACCESS LIST — the OIDC/well-known call returns 403. Add this cluster's egress IP "
-                     f"({egress_ip}) to the Lakebase workspace IP access list. [NETWORKING.md → IP access lists]")
-if has("LAKEBASE_CRED_403"):
-    diagnoses.append(f"• LAKEBASE NETWORK POLICY (not the workspace IP ACL) — /api/2.0/postgres/credentials "
-                     f"returns 403 even though OAuth succeeded from this same IP ({egress_ip}). The credential "
-                     "endpoint enforces a network policy SEPARATE from the workspace IP access list, so "
-                     "allowlisting the workspace IP ACL is necessary but not sufficient. "
-                     "FIRST STEP (self-service): check whether the TARGET workspace has a context-based "
-                     "ingress / serverless network policy this source isn't allowed under — diff it against a "
-                     "known-working workspace. Escalating to Databricks (with the request_id above) is the "
-                     "FALLBACK if the target has no such policy. [NETWORKING.md → Other ingress controls]")
+if has("PL_INGRESS"):
+    diagnoses.append("• PRIVATELINK INGRESS — a control-plane call was rejected with "
+                     "\"Unauthorized private link access to workspace\". The target workspace accepts "
+                     "traffic only from private endpoints it has registered, and the endpoint this "
+                     "request arrived on is not one of them. Note PrivateLink DNS is regional, so a "
+                     "PrivateLink-wired VPC reaches the target over ITS OWN endpoint rather than the "
+                     "NAT gateway — which is why adding NAT/public IPs to the target's IP access list "
+                     "does not help here. Fix: have the target workspace's account admin register this "
+                     "source's private endpoint on the target's private access settings (front-end for "
+                     "workspace APIs; service-direct additionally for the Lakebase database path). "
+                     "[NETWORKING.md → Front-end PL]")
+if has("PUBLIC_ACCESS_DISABLED"):
+    diagnoses.append("• PUBLIC ACCESS DISABLED — the target workspace requires a private path and this "
+                     "request arrived over the public route. Either reach it over PrivateLink, or have "
+                     "its admin enable public access. [NETWORKING.md → Front-end PL]")
+if has("IP_ACL"):
+    diagnoses.append(f"• IP ACCESS LIST — a control-plane call was rejected as unauthorized network "
+                     f"access. Add this cluster's egress IP ({egress_ip}) to the target workspace's IP "
+                     f"access list. Check EVERY NAT gateway: multi-AZ VPCs have one per availability "
+                     f"zone, so a cluster can egress from an address you did not add. "
+                     f"[NETWORKING.md → IP access lists]")
+if has("HTTP_403") or has("ENDPOINT_NOT_FOUND"):
+    diagnoses.append("• 403 WITH NO NETWORK REASON — a call returned 403 but carried no "
+                     "X-Databricks-Reason-Phrase naming a network layer. That is shaped like an "
+                     "authorization failure, not a network block: check that the service principal "
+                     "exists in the TARGET workspace and has permission on this Lakebase project and "
+                     "branch, before pursuing any network change.")
 if has("HTTP_TIMEOUT") or has("HTTP_CONN_ERROR"):
     diagnoses.append("• LEG A BLOCKED — control-plane calls time out/reset. Either the Lakebase workspace has "
                      "front-end PrivateLink with public access disabled (and this VPC has no private route to "
@@ -631,9 +798,15 @@ print()
 print(f"Leg A (control plane, 443) : {leg_status('A')}")
 print(f"Leg B (data path, 5432)    : {leg_status('B')}")
 
+print()
+print("Before sharing this output: it contains your egress IP, workspace hostname, "
+      "resolved IP addresses and request IDs. No tokens or secrets are included. "
+      "That is normally exactly what a support case needs, but review it if you are "
+      "posting somewhere public.")
+
 dbutils.notebook.exit(json.dumps({
     "leg_a": leg_status("A"), "leg_b": leg_status("B"),
     "egress_ip": egress_ip,
-    "cred_mint_request_id": globals().get("cred_response_request_id") or globals().get("cred_request_id"),
+    "cred_mint_request_id": globals().get("cred_request_id"),
     "results": RESULTS,
 }, default=str))
