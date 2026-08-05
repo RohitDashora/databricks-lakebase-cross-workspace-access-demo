@@ -374,30 +374,37 @@ elif "public" in ws_kinds:
 # Service-Direct PrivateLink backs the Lakebase database path specifically, and is a
 # SEPARATE endpoint from classic front-end workspace PrivateLink. When it is missing or
 # its DNS is unwired, database traffic silently falls back to the public route.
-if DB_HOST_OVERRIDE or LB_HOSTNAME.count(".") >= 2:
-    region_guess = ""
-    if DB_HOST_OVERRIDE and ".database." in DB_HOST_OVERRIDE:
-        region_guess = DB_HOST_OVERRIDE.split(".database.", 1)[1].split(".", 1)[0]
-    if region_guess:
-        tld = "azuredatabricks.net" if "azuredatabricks" in LB_HOSTNAME else "cloud.databricks.com"
-        sd_pl = f"{region_guess}.service-direct.privatelink.{tld}"
-        # NXDOMAIN here is EXPECTED on a public-path setup, so this is informational
-        # rather than a failure -- it only matters when the target requires a private
-        # path (i.e. alongside a PL_INGRESS or PUBLIC_ACCESS_DISABLED rejection).
-        try:
-            _sd_ips = sorted({i[4][0] for i in socket.getaddrinfo(sd_pl, None)})
-            record(f"Service-direct PL DNS ({region_guess})", "A", "INFO",
-                   f"{sd_pl} resolves to {', '.join(_sd_ips)} "
-                   f"({'private -- service-direct PL is wired up' if any(classify_ip(i) == 'private' for i in _sd_ips) else 'public'})")
-        except socket.gaierror:
-            record(f"Service-direct PL DNS ({region_guess})", "A", "INFO",
-                   f"{sd_pl} does not resolve. Expected on a public-path setup. If the "
-                   f"target requires a private path for the database plane, this DNS "
-                   f"record (and the service-direct endpoint) is what is missing.")
-    else:
+def service_direct_probe(db_hostname):
+    """Check the service-direct PrivateLink DNS chain for the database plane.
+
+    The region comes from the database hostname (ep-*.database.<region>...), so this
+    can only run once that host is known -- either from DB_HOST_OVERRIDE or from
+    discovery in Probe 6. Called from the Leg B section for that reason.
+    """
+    if not db_hostname or ".database." not in db_hostname:
         record("Service-direct PL DNS", "A", "SKIP",
-               "Set DB_HOST_OVERRIDE (or let Probe 6 resolve the DB host) to derive the "
-               "region and check the service-direct PrivateLink DNS chain.")
+               "Need the database hostname to derive the region. Set DB_HOST_OVERRIDE "
+               "(ep-*.database.<region>...) if discovery is blocked.")
+        return
+    region = db_hostname.split(".database.", 1)[1].split(".", 1)[0]
+    tld = "azuredatabricks.net" if "azuredatabricks" in db_hostname else "cloud.databricks.com"
+    sd_pl = f"{region}.service-direct.privatelink.{tld}"
+    # NXDOMAIN here is EXPECTED on a public-path setup, so this is informational rather
+    # than a failure -- it only matters when the target requires a private path (i.e.
+    # alongside a PL_INGRESS or PUBLIC_ACCESS_DISABLED rejection).
+    try:
+        ips = sorted({i[4][0] for i in socket.getaddrinfo(sd_pl, None)})
+        wired = any(classify_ip(i) == "private" for i in ips)
+        record(f"Service-direct PL DNS ({region})", "A", "INFO",
+               f"{sd_pl} resolves to {', '.join(ips)} "
+               + ("(private -- service-direct PrivateLink is wired up)" if wired
+                  else "(public -- resolving to public IPs, so the database plane is "
+                       "NOT going over service-direct PrivateLink)"))
+    except socket.gaierror:
+        record(f"Service-direct PL DNS ({region})", "A", "INFO",
+               f"{sd_pl} does not resolve. Expected on a public-path setup. If the target "
+               f"requires a private path for the database plane, this DNS record (and the "
+               f"service-direct endpoint behind it) is what is missing.")
 
 # COMMAND ----------
 
@@ -586,6 +593,9 @@ if not db_host:
            "notebook, set it in code here to test Leg B in isolation.")
 else:
     dns_probe("Resolve DB endpoint host (Leg B)", "B", db_host)
+    # Now that the DB host is known, the region can be derived for the service-direct
+    # PrivateLink chain that backs this database path.
+    service_direct_probe(db_host)
     legB_tcp = tcp_probe("TCP 5432 to DB endpoint", "B", db_host, 5432)
 
 # COMMAND ----------
@@ -609,8 +619,12 @@ else:
         t0 = time.time()
         try:
             r = requests.get(f"https://{api_host}/", timeout=15)
+            # Any HTTP status means the request reached the service and came back, which
+            # is what this probe tests. 400/401/404 on the bare root path are normal --
+            # we are not calling a real API route. Only a network failure matters here.
             record("HTTP to api.database", "A", "PASS",
-                   f"HTTP {r.status_code} — data API reachable at the app layer",
+                   f"HTTP {r.status_code} — reached the data API endpoint (any status "
+                   f"means the network path works; a bare GET / is not a valid route)",
                    latency_ms=int((time.time()-t0)*1000))
         except requests.exceptions.Timeout:
             record("HTTP to api.database", "A", "FAIL",
