@@ -305,8 +305,11 @@ if mode is None:
 elif mode.upper() in SHARED_MODES:
     record("Cluster access mode", "B", "WARN",
            f"data_security_mode={mode} (Standard/Shared, via {src}) — Standard/Shared classic clusters "
-           "BLOCK outbound 5432. Leg B cannot work here. Re-run on a Dedicated/Single-user cluster "
-           "or serverless.")
+           "BLOCK outbound 5432 on DBR 17 and below, so Leg B cannot work here. Re-run on a "
+           "Dedicated/Single-user cluster or serverless. NOTE the UI renamed these: the mode you "
+           "want is now called 'Dedicated' (formerly 'Single user'), and 'Standard' (formerly "
+           "'Shared') is the one that blocks 5432 — picking 'Standard' because it sounds like the "
+           "default is a common mistake. Check the cluster's Access mode in the UI, not the name.")
 elif mode.upper() in DEDICATED_MODES:
     record("Cluster access mode", "B", "PASS",
            f"data_security_mode={mode} (Dedicated/Single-user, via {src}) — outbound 5432 is permitted.")
@@ -333,7 +336,11 @@ for url in ("https://checkip.amazonaws.com", "https://api.ipify.org", "https://i
         if r.ok:
             egress_ip = r.text.strip()
             record("Egress public IP", "—", "INFO",
-                   f"This cluster egresses as {egress_ip}  (allowlist this on the Lakebase workspace IP ACL)")
+                   f"This cluster egresses as {egress_ip}. This is the NAT gateway for the "
+                   f"availability zone THIS cluster happens to be in -- a multi-AZ VPC has one "
+                   f"NAT gateway per AZ, so another cluster (or this one after a restart) can "
+                   f"egress from a different address. When allowlisting on the target workspace, "
+                   f"add every NAT gateway IP in the VPC, not just this one.")
             break
     except Exception:
         continue
@@ -589,8 +596,10 @@ if not db_host and DB_HOST_OVERRIDE:
 legB_tcp = False
 if not db_host:
     record("DNS + TCP 5432 to DB endpoint", "B", "SKIP",
-           "DB host not resolved (Leg A incomplete). If you already know the host from the basic "
-           "notebook, set it in code here to test Leg B in isolation.")
+           "DB host not resolved (Leg A incomplete). Set the db_host_override widget to an "
+           "ep-*.database.<region>... hostname to test Leg B in isolation. Note Leg B also "
+           "needs a DB token, which comes from the credential mint on Leg A -- so if Leg A is "
+           "blocked, fix that first; Leg B cannot pass until it is.")
 else:
     dns_probe("Resolve DB endpoint host (Leg B)", "B", db_host)
     # Now that the DB host is known, the region can be derived for the service-direct
@@ -807,6 +816,14 @@ if not diagnoses:
 
 for d in diagnoses:
     print(d)
+
+# Leg B needs a DB token, which only the Leg A credential mint can produce. When Leg A
+# is blocked, Leg B's SKIPs are a consequence -- not a second, separate problem. Say so,
+# so nobody chases 5432 while the real blocker is on the control plane.
+if leg_status("A") == "FAIL" and leg_status("B") in ("UNKNOWN", "SKIP"):
+    print("• ORDER OF OPERATIONS — Leg B is unresolved only because Leg A is blocked: the "
+          "Postgres connection needs a DB token, and minting it is a Leg A call. Fix Leg A "
+          "first, then re-run to evaluate Leg B. Leg B is NOT independently confirmed broken.")
 
 print()
 print(f"Leg A (control plane, 443) : {leg_status('A')}")
