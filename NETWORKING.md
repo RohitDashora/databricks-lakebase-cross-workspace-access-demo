@@ -193,8 +193,11 @@ flowchart TB
 > IP access list. This is why "move to PrivateLink" and "allowlist my NAT IP"
 > are two different, mutually-exclusive fixes for the same 403.
 
-The diagnostic emits `HTTP_403_IP_ACL` (block string: `Source IP ... is blocked
-by Databricks IP ACL`).
+The diagnostic emits `IP_ACL` for this (reason phrase: `Source IP ... is blocked
+by Databricks IP ACL`, or `Unauthorized network access to workspace`). If instead
+you see `PL_INGRESS` (`Unauthorized private link access to workspace`), the
+request arrived over PrivateLink and the IP access list was never consulted — see
+that row in the [signature table](#signature-table).
 
 Docs: [IP access lists (AWS)](https://docs.databricks.com/aws/en/security/network/front-end/ip-access-list).
 
@@ -423,7 +426,10 @@ These map 1:1 to the `error_class` values the diagnostic notebook emits.
 | Notebook signature | What it means | Fix |
 |---|---|---|
 | `DNS_NXDOMAIN` | a hostname won't resolve | Under PrivateLink you need **private DNS** for `*.database.<region>.cloud.databricks.com` (Route 53 private hosted zone / Azure private DNS zone). On the public path, check your resolver isn't filtering. |
-| `HTTP_403_IP_ACL` | `Source IP ... is blocked by Databricks IP ACL` (on OIDC/well-known) | Add the cluster's **egress IP** (printed by Probe 1) to the Lakebase workspace IP access list (§3a). |
+| `IP_ACL` | reason phrase says `Source IP ... is blocked by Databricks IP ACL` / `Unauthorized network access to workspace` | Add the cluster's **egress IP** (printed by Probe 1) to the target workspace's IP access list (§3a). Check **every** NAT gateway — multi-AZ VPCs have one per AZ. |
+| `PL_INGRESS` | reason phrase says `Unauthorized private link access to workspace <id>` | The target accepts only **registered private endpoints**, and the one this request arrived on isn't registered. PrivateLink DNS is *regional*, so a PL-wired VPC reaches the target over **its own** endpoint and never uses the NAT gateway — adding NAT IPs to the IP ACL cannot fix this. Register the source's private endpoint on the target's private access settings (front-end for workspace APIs; **Service-Direct** additionally for the database path, §3d). |
+| `PUBLIC_ACCESS_DISABLED` | reason phrase says `Public access is not allowed for workspace` | Target requires a private path; this request came over the public route. Reach it over PrivateLink, or have its admin enable public access. |
+| `HTTP_403` | 403 with **no** `X-Databricks-Reason-Phrase` naming a network layer | Shaped like an **authorization** failure, not a network block. Check the SP exists in the target workspace and has permission on the Lakebase project/branch before changing any network config. |
 | `HTTP_TIMEOUT` / `HTTP_CONN_ERROR` | control-plane calls hang or reset | Front-end PrivateLink with public access disabled and **no private route from this VPC**, or an egress firewall blocking 443. Provision a private route (front-end PL endpoint) or open 443 egress (§3c). |
 | `DATA_API_BLOCKED` (`api.database.*`) | the data API is unreachable while the workspace host / 5432 may be fine | `api.database.<region>` blocked by proxy / PL / firewall on 443. Symptom: "SQL Editor broken but notebook queries work" (or vice-versa). Allowlist `api.database.<region>` on 443. See [the 4 scenarios](#which-surface-is-blocked-the-4-scenarios). |
 | `OAUTH_BAD_CREDS` | reachable, creds rejected (401/400) | **Not a network problem.** Check `client_id`/`client_secret` and that the SP exists in the Lakebase workspace. |
@@ -431,7 +437,6 @@ These map 1:1 to the `error_class` values the diagnostic notebook emits.
 | `PG_SSL_ERROR` | TLS negotiation broke on 5432 | A TLS-intercepting forward proxy is breaking Postgres SSL (it can't be MITM'd like HTTPS). Bypass the proxy for the DB endpoint. (Squid: add `hosts_file /etc/hosts` and allow `*.database.*.cloud.databricks.com`.) |
 | `PG_SSL_DISABLED` (`Invalid protocol version: 196608`) | connected, but SSL wasn't negotiated | Set `sslmode=require` on the connection. |
 | `PG_TOKEN_OR_IDENTITY` (`Invalid authorization for databricks identity login`) | OAuth token expired (~1h) or a group identity is being used on a dedicated cluster | Re-mint the token; ensure the dedicated cluster's single-user identity matches the SP/user that owns the Postgres role. |
-| `LAKEBASE_CRED_403` | `Unauthorized network access to workspace <id>` — **403 on `/api/2.0/postgres/credentials` while OAuth from the same IP succeeded** | The credential-mint endpoint enforces a **network policy separate from the workspace IP ACL** (necessary but not sufficient). The target likely has **front-end PL enabled** so the Lakebase plane needs the **Service-Direct** endpoint (§3d) — `public access enabled` only covers the front door. See the [case study](#5-case-study--the-solved-403). |
 | `PG_AUTH_FAILED` | TCP 5432 connected, Postgres rejected the login | **Network is fine.** SP Postgres role / GRANT step — see the main [README](README.md) gotchas #4, #5. |
 
 Two more that aren't network failures but bite people:
@@ -533,11 +538,14 @@ the simple case works and this one didn't.
 **The fix (confirmed).** Provision the **Service-Direct inbound endpoint** and
 route the caller through it (§3d) — *not* an additional IP allowlist entry. With
 Service-Direct in place, both `api.database.*` (443) and `ep-*` (5432) reach the
-Lakebase plane privately and the credential mint succeeds. The diagnostic flags
-this exact case as `LAKEBASE_CRED_403` (distinct from `HTTP_403_IP_ACL`, which
-appears on OIDC). If a target already has Service-Direct registered and still
-403s, all documented controls are satisfied — capture the `request_id` from the
-response and escalate.
+Lakebase plane privately and the credential mint succeeds.
+
+The diagnostic reports this as `PL_INGRESS`, keyed on the reason phrase
+`Unauthorized private link access to workspace <id>` rather than on which call
+failed — the same phrase can surface on the credential mint, on the endpoint
+listing, or on an Apps request, and it means the same thing each time. If a target
+already has Service-Direct registered and still 403s, all documented controls are
+satisfied — capture the `request_id` from the response and escalate.
 
 ---
 

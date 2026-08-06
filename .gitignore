@@ -27,3 +27,6 @@ secrets.json
 
 # GOTM working ledger (not part of the deliverable)
 .gotm/
+
+# Local test harness (not part of the deliverable)
+tests/
